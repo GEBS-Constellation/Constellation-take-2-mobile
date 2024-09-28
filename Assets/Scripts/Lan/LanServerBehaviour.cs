@@ -1,88 +1,42 @@
+using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Unity.Collections;
-using Unity.Jobs;
 using Unity.Networking.Transport;
 using UnityEngine;
 
-public class LanServerBehaviour : MonoBehaviour
+public class LanServerBehaviour : SingletonObject<LanServerBehaviour>
 {
-    public static LanServerBehaviour Instance;
+    public static string IP { get; private set; }
 
     private NetworkDriver driver;
     private NativeList<NetworkConnection> connections;
-    private JobHandle serverJobHandle;
+
+    public List<Guid> ClientIds = new List<Guid>();
 
     private UdpClient udpClient;
     private IPEndPoint broadcastEndPoint = new IPEndPoint(IPAddress.Broadcast, LanCommon.LanPort);
+    private bool _udpBroadcastActive = true;
+    private float _udpTimerDelay = 3;
+    private float _udpTimerCurrentTime = 0;
+    private string _udpBroadcastMessage = "Constellation Server";
 
     public int MaxPlayerCount = 8;
 
-    private struct ServerUpdateConnectionsJob : IJob
-    {
-        public NetworkDriver Driver;
-        public NativeList<NetworkConnection> Connections;
-
-        public void Execute()
-        {
-            // Clean up connections.
-            for (int i = 0; i < Connections.Length; i++)
-            {
-                if (!Connections[i].IsCreated)
-                {
-                    Connections.RemoveAtSwapBack(i);
-                    i--;
-                }
-            }
-
-            // Accept new connections.
-            NetworkConnection c;
-            while ((c = Driver.Accept()) != default)
-            {
-                Connections.Add(c);
-                ServerLog("Accepted new client connection.");
-            }
-        }
-    }
-
-    private struct ServerUpdateJob : IJobParallelForDefer
-    {
-        public NetworkDriver.Concurrent Driver;
-        public NativeArray<NetworkConnection> Connections;
-
-        public void Execute(int i)
-        {
-            DataStreamReader stream;
-            NetworkEvent.Type cmd;
-            while ((cmd = Driver.PopEventForConnection(Connections[i], out stream)) != NetworkEvent.Type.Empty)
-            {
-                switch (cmd)
-                {
-                    case NetworkEvent.Type.Connect:
-                        ServerLog($"Client {i} connected!");
-
-                        RequestSendData(ref Driver, Connections[i], 123);
-                        break;
-
-                    case NetworkEvent.Type.Data:
-                        uint number = stream.ReadUInt();
-                        ServerLog($"Got uint {number} from client {i}");
-                        break;
-
-                    case NetworkEvent.Type.Disconnect:
-                        ServerLog($"Client {i} disconnected!");
-                        Connections[i] = default;
-                        break;
-                }
-            }
-        }
-    }
+    public Action<Guid> ClientConnected { get; set; }
+    public Action<Guid> ClientDisconnected { get; set; }
+    public Action<string> ClientDataReceived { get; set; }
 
     void Start()
     {
         Instance = this;
         DontDestroyOnLoad(gameObject);
+
+        MainThreadRunner.EnsureInitialized();
+
+        IP = LanCommon.GetLocalIP();
 
         driver = NetworkDriver.Create();
         connections = new NativeList<NetworkConnection>(MaxPlayerCount, Allocator.Persistent);
@@ -103,13 +57,13 @@ public class LanServerBehaviour : MonoBehaviour
 
     void OnDestroy()
     {
+        Instance = null;
+
         if (driver.IsCreated)
         {
-            serverJobHandle.Complete();
             driver.Dispose();
             connections.Dispose();
         }
-
         if (udpClient != null)
         {
             udpClient.Close();
@@ -118,43 +72,65 @@ public class LanServerBehaviour : MonoBehaviour
 
     void Update()
     {
-        serverJobHandle.Complete();
-
-        ServerUpdateConnectionsJob connectionJob = new ServerUpdateConnectionsJob
+        if (_udpBroadcastActive && !string.IsNullOrWhiteSpace(IP))
         {
-            Driver = driver,
-            Connections = connections
-        };
+            _udpTimerCurrentTime += Time.deltaTime;
+            if (_udpTimerCurrentTime >= _udpTimerDelay)
+            {
+                _udpTimerCurrentTime = 0;
+                SendUdpBroadcast(_udpBroadcastMessage);
+            }
+        }
 
-        ServerUpdateJob serverUpdateJob = new ServerUpdateJob
+        driver.ScheduleUpdate().Complete();
+
+        // Clean up connections
+        for (int i = 0; i < connections.Length; i++)
         {
-            Driver = driver.ToConcurrent(),
-            Connections = connections.AsDeferredJobArray()
-        };
+            if (!connections[i].IsCreated)
+            {
+                connections.RemoveAtSwapBack(i);
+                i--;
+            }
+        }
 
-        serverJobHandle = driver.ScheduleUpdate();
-        serverJobHandle = connectionJob.Schedule(serverJobHandle);
-        serverJobHandle = serverUpdateJob.Schedule(connections, 1, serverJobHandle);
-    }
+        // Accept new connections
+        NetworkConnection c;
+        while ((c = driver.Accept()) != default)
+        {
+            connections.Add(c);
+            Guid id = Guid.NewGuid();
+            ServerLog($"New client connected! Index {connections.Length - 1}, ID {id}");
+            ClientIds.Add(id);
+            ClientConnected?.Invoke(id);
+        }
 
-    public void SendUdpBroadcast(string message)
-    {
-        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
-        udpClient.Send(messageBytes, messageBytes.Length, broadcastEndPoint);
-        ServerLog($"UDP broadcast message sent: {message}");
-    }
+        // Handle new events
+        for (int i = 0; i < connections.Length; i++)
+        {
+            DataStreamReader stream;
+            NetworkEvent.Type cmd;
+            while ((cmd = driver.PopEventForConnection(connections[i], out stream)) != NetworkEvent.Type.Empty)
+            {
+                switch (cmd)
+                {
+                    case NetworkEvent.Type.Disconnect:
+                        Guid disconnectedId = ClientIds[i];
+                        ServerLog($"Client disconnected! Index {i}, ID {disconnectedId}");
+                        ClientIds.Remove(disconnectedId);
+                        ClientDisconnected?.Invoke(disconnectedId);
+                        connections[i] = default;
+                        break;
 
-    public void RequestSendData(int index, uint value)
-    {
-        driver.BeginSend(connections[index], out DataStreamWriter writer);
-        writer.WriteUInt(value);
-        driver.EndSend(writer);
-    }
-    public static void RequestSendData(ref NetworkDriver.Concurrent driver, NetworkConnection connection, uint value)
-    {
-        driver.BeginSend(connection, out DataStreamWriter writer);
-        writer.WriteUInt(value);
-        driver.EndSend(writer);
+                    case NetworkEvent.Type.Data:
+                        string data = stream.ReadFixedString128().ToString();
+                        Guid dataClientId = ClientIds[i];
+                        ServerLog($"Received string data from client index {i} id {dataClientId}: {data}");
+                        ClientDataReceived?.Invoke(data);
+                        break;
+                }
+            }
+        }
     }
 
     private static void ServerLog(string message, bool warning = false)
@@ -167,5 +143,67 @@ public class LanServerBehaviour : MonoBehaviour
         {
             Debug.Log($"Server: {message}");
         }
+    }
+
+    public void ToggleUdpBroadcast(bool enabled)
+    {
+        _udpBroadcastActive = enabled;
+    }
+    public void SendUdpBroadcast(string message)
+    {
+        if (_udpBroadcastActive)
+        {
+            byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+            udpClient.Send(messageBytes, messageBytes.Length, broadcastEndPoint);
+            ServerLog($"UDP broadcast message sent: {message}");
+        }
+    }
+
+    public void RequestSendData(Guid id, string data)
+    {
+        int index = ClientIds.FindIndex(x => x == id);
+        if (index != -1)
+        {
+            RequestSendData(index, data);
+            return;
+        }
+
+        ServerLog($"Requested send data to invalid client id {id}", true);
+    }
+    private void RequestSendData(int index, string data)
+    {
+        if (index >= 0 && index < ClientIds.Count)
+        {
+            ServerLog($"Sending data [{data}] to client index {index}");
+            driver.BeginSend(connections[index], out DataStreamWriter writer);
+            writer.WriteFixedString128(data);
+            driver.EndSend(writer);
+            return;
+        }
+
+        ServerLog($"Requested send data to invalid client index {index}", true);
+    }
+
+    public void RequestKickPlayer(Guid id)
+    {
+        int index = ClientIds.FindIndex(x => x == id);
+        if (index != -1)
+        {
+            RequestKickPlayer(index);
+            return;
+        }
+
+        ServerLog($"Requested kicking invalid client id {id}", true);
+    }
+    private void RequestKickPlayer(int index)
+    {
+        if (index >= 0 && index < ClientIds.Count)
+        {
+            ServerLog($"Kicking client index {index}");
+            driver.Disconnect(connections[index]);
+            return;
+        }
+
+        ServerLog($"Requested kicking invalid client index {index}", true);
     }
 }

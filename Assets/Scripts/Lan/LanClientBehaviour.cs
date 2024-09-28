@@ -3,81 +3,44 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Unity.Collections;
-using Unity.Jobs;
 using Unity.Networking.Transport;
 using UnityEngine;
 
-public class LanClientBehaviour : MonoBehaviour
+public class LanClientBehaviour : SingletonObject<LanClientBehaviour>
 {
-    public static LanClientBehaviour Instance;
-
     private NetworkDriver driver;
-    private NativeArray<NetworkConnection> connection;
-    private JobHandle clientJobHandle;
+    private NetworkConnection connection;
 
     private UdpClient udpClient;
     private IPEndPoint receiveEndPoint = new IPEndPoint(IPAddress.Any, LanCommon.LanPort);
+    private bool parseUdpBroadcasts = true;
 
     public Action<string, string> ServerUDPMessageReceived { get; set; }
+    public Action ConnectedToServer { get; set; }
+    public Action DisconnectedFromServer { get; set; }
+    public Action<string> ServerDataReceived { get; set; }
 
     [Header("Server info (DoNotEdit)")]
     public static string ServerIP;
-
-    private struct ClientUpdateJob : IJob
-    {
-        public NetworkDriver Driver;
-        public NativeArray<NetworkConnection> Connection;
-
-        public void Execute()
-        {
-            if (!Connection[0].IsCreated)
-            {
-                return;
-            }
-
-            DataStreamReader stream;
-            NetworkEvent.Type cmd;
-            while ((cmd = Connection[0].PopEvent(Driver, out stream)) != NetworkEvent.Type.Empty)
-            {
-                switch (cmd)
-                {
-                    case NetworkEvent.Type.Connect:
-                        ClientLog($"Successfully connected to IP: {ServerIP}");
-
-                        RequestSendData(ref Driver, Connection[0], 321);
-                        break;
-
-                    case NetworkEvent.Type.Data:
-                        uint value = stream.ReadUInt();
-                        ClientLog($"Got the uint value {value} back from IP: {ServerIP}");
-                        break;
-
-                    case NetworkEvent.Type.Disconnect:
-                        ClientLog($"Disconnected from IP: {ServerIP}");
-                        Connection[0] = default;
-                        break;
-                }
-            }
-        }
-    }
 
     void Start()
     {
         Instance = this;
         DontDestroyOnLoad(gameObject);
 
+        MainThreadRunner.EnsureInitialized();
+
         driver = NetworkDriver.Create();
-        connection = new NativeArray<NetworkConnection>(1, Allocator.Persistent);
 
         udpClient = new(receiveEndPoint);
         udpClient.BeginReceive(ReceiveUdpMessageCallback, null);
+        ClientLog("Started listening for UDP broadcasts");
     }
 
     void OnDestroy()
     {
-        clientJobHandle.Complete();
+        Instance = null;
         driver.Dispose();
-        connection.Dispose();
 
         if (udpClient != null)
         {
@@ -87,51 +50,42 @@ public class LanClientBehaviour : MonoBehaviour
 
     void Update()
     {
-        clientJobHandle.Complete();
+        driver.ScheduleUpdate().Complete();
 
-        ClientUpdateJob job = new ClientUpdateJob
+        if (IsConnectedToServer())
         {
-            Driver = driver,
-            Connection = connection,
-        };
-        clientJobHandle = driver.ScheduleUpdate();
-        clientJobHandle = job.Schedule(clientJobHandle);
-    }
+            DataStreamReader stream;
+            NetworkEvent.Type cmd;
+            while ((cmd = connection.PopEvent(driver, out stream)) != NetworkEvent.Type.Empty)
+            {
+                switch (cmd)
+                {
+                    case NetworkEvent.Type.Connect:
+                        OnConnected();
+                        break;
 
-    public bool TryStartConnect(string ip)
-    {
-        if (NetworkEndpoint.TryParse(ip, LanCommon.LanPort, out NetworkEndpoint endpoint))
-        {
-            ClientLog($"Trying to connect to IP {ip}, port {LanCommon.LanPort}");
-            ServerIP = ip;
-            clientJobHandle.Complete();
-            connection[0] = driver.Connect(endpoint);
-            return true;
+                    case NetworkEvent.Type.Disconnect:
+                        OnDisconnected();
+                        break;
+
+                    case NetworkEvent.Type.Data:
+                        OnDataReceived(ref stream);
+                        break;
+                }
+            }
         }
-
-        ClientLog($"Failed to connect to {ip}!", true);
-        return false;
-    }
-
-    public void RequestSendData(uint value)
-    {
-        driver.BeginSend(connection[0], out DataStreamWriter writer);
-        writer.WriteUInt(value);
-        driver.EndSend(writer);
-    }
-    public static void RequestSendData(ref NetworkDriver driver, NetworkConnection connection, uint value)
-    {
-        driver.BeginSend(connection, out DataStreamWriter writer);
-        writer.WriteUInt(value);
-        driver.EndSend(writer);
     }
 
     private void ReceiveUdpMessageCallback(IAsyncResult asyncResult)
     {
         byte[] receivedBytes = udpClient.EndReceive(asyncResult, ref receiveEndPoint);
-        string receivedMessage = Encoding.UTF8.GetString(receivedBytes);
-        ClientLog($"Received UDP broadcast! Message '{receivedMessage}' from IP: {receiveEndPoint.Address}");
-        ServerUDPMessageReceived.Invoke(receiveEndPoint.Address.ToString(), receivedMessage);
+
+        if (parseUdpBroadcasts)
+        {
+            string receivedMessage = Encoding.UTF8.GetString(receivedBytes);
+            ClientLog($"Received UDP broadcast! Message '{receivedMessage}' from IP: {receiveEndPoint.Address}");
+            ServerUDPMessageReceived.Invoke(receiveEndPoint.Address.ToString(), receivedMessage);
+        }
 
         udpClient.BeginReceive(ReceiveUdpMessageCallback, null);
     }
@@ -146,5 +100,73 @@ public class LanClientBehaviour : MonoBehaviour
         {
             Debug.Log($"Client: {message}");
         }
+    }
+
+    public bool IsConnectedToServer()
+        => connection != null && connection.IsCreated;
+
+    public bool TryStartConnect(string ip)
+    {
+        if (IsConnectedToServer())
+        {
+            ClientLog($"Already connected to server at {ServerIP}!", true);
+            return false;
+        }
+
+        if (NetworkEndpoint.TryParse(ip, LanCommon.LanPort, out NetworkEndpoint endpoint))
+        {
+            ClientLog($"Trying to connect to IP {ip}, port {LanCommon.LanPort}");
+            parseUdpBroadcasts = false;
+            ServerIP = ip;
+
+            connection = driver.Connect(endpoint);
+            return true;
+        }
+
+        ClientLog($"Failed to connect to {ip}!", true);
+        return false;
+    }
+
+    public void RequestSendData(string data)
+    {
+        if (IsConnectedToServer())
+        {
+            ClientLog($"Sending string data to server: {data}");
+            driver.BeginSend(connection, out DataStreamWriter writer);
+            writer.WriteFixedString128(data);
+            driver.EndSend(writer);
+            return;
+        }
+
+        ClientLog($"Cannot send data to server while disconnected!", true);
+    }
+
+    public void RequestDisconnect()
+    {
+        if (IsConnectedToServer())
+        {
+            ClientLog($"Requested disconnect from server at {ServerIP}");
+            driver.Disconnect(connection);
+            OnDisconnected();
+        }
+    }
+
+    private void OnConnected()
+    {
+        ClientLog($"Connected to server at {ServerIP}");
+        ConnectedToServer?.Invoke();
+    }
+    private void OnDataReceived(ref DataStreamReader stream)
+    {
+        string data = stream.ReadFixedString128().ToString();
+        ClientLog($"Received string data from server: {data}");
+        ServerDataReceived?.Invoke(data);
+    }
+    private void OnDisconnected()
+    {
+        ClientLog($"Disconnected from server at {ServerIP}");
+        connection = default;
+        parseUdpBroadcasts = true;
+        DisconnectedFromServer?.Invoke();
     }
 }
